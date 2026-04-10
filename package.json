@@ -1,7 +1,7 @@
 {
   "name": "skool-reddit-research-actor",
-  "version": "2.0.0",
-  "description": "Scrapes Reddit for Skool community pain points. All keywords editable from Input tab.",
+  "version": "7.0.0",
+  "description": "Collects Skool creator pain points from Reddit via PullPush.io mirror — no OAuth needed, no 403 blocks.",
   "main": "src/main.js",
   "type": "module",
   "scripts": {
@@ -15,137 +15,92 @@
     "node": ">=20.0.0"
   },
   "apify": {
-    "title": "Skool — Reddit Research v3",
-    "description": "Uses Reddit JSON API (no browser) to collect all Skool-related posts and comments across 15+ subreddits. 25 built-in keywords, pagination, no filtering — collects everything.",
-    "version": "3.0.0",
+    "title": "Skool — Reddit Research v7",
+    "description": "Finds creators talking about Skool problems via PullPush.io (Reddit mirror). No API key needed. Searches posts + comments for: engagement issues, email/CRM pain, automation gaps, churn, platform limitations, migration signals.",
+    "version": "7.0.0",
     "inputSchema": {
       "title": "Skool Reddit Research",
       "type": "object",
       "schemaVersion": 1,
       "properties": {
-        "redditClientId": {
-          "title": "🔑 Reddit Client ID (OAuth)",
-          "type": "string",
-          "description": "Required to avoid 403 blocks. Get free credentials: reddit.com/prefs/apps → Create App → Script type. Copy the ID shown under the app name.",
-          "editor": "textfield",
-          "default": ""
-        },
-        "redditClientSecret": {
-          "title": "🔒 Reddit Client Secret (OAuth)",
-          "type": "string",
-          "description": "The 'secret' field from your Reddit app. Without this, requests will be blocked.",
-          "editor": "textfield",
-          "isSecret": true,
-          "default": ""
-        },
-        "redditUsername": {
-          "title": "👤 Your Reddit Username",
-          "type": "string",
-          "description": "Your Reddit username (without u/). Used in User-Agent string as required by Reddit API rules.",
-          "editor": "textfield",
-          "default": "skoolresearch"
-        },
-        "searchKeywords": {
-          "title": "🔍 Search Keywords",
-          "type": "array",
-          "description": "Šta da traži na Redditu. Misli kao tvoj ICP — šta bi oni ukucali u search.",
-          "editor": "stringList",
-          "default": [
-            "skool community members not engaging",
-            "skool nobody posts in my community",
-            "skool email collection how to",
-            "skool zapier integration problem",
-            "skool members leaving churn",
-            "skool free to paid conversion",
-            "skool automation missing",
-            "skool analytics reporting",
-            "skool platform limitations",
-            "skool funnel setup",
-            "skool onboarding new members",
-            "skool retention strategy",
-            "skool community ghost town",
-            "skool crm integration",
-            "skool member engagement tips"
-          ]
+        "useBuiltinKeywords": {
+          "title": "✅ Use built-in creator keywords",
+          "type": "boolean",
+          "description": "Use the 140+ pre-built keywords targeting Skool creator pain points.",
+          "default": true
         },
         "extraKeywords": {
-          "title": "➕ Extra Keywords (dodaj bez brisanja defaulta)",
+          "title": "➕ Extra Keywords",
           "type": "array",
-          "description": "Testuj nove search termine bez menjanja glavne liste.",
+          "description": "Add more search terms on top of the built-in list.",
           "editor": "stringList",
           "default": []
         },
         "subreddits": {
-          "title": "📋 Subreddits",
+          "title": "📋 Subreddits (for targeted search)",
           "type": "array",
-          "description": "Koji subreddits da pretražuje.",
+          "description": "Priority keywords will be searched in each of these subreddits specifically.",
           "editor": "stringList",
           "default": [
-            "skool",
             "entrepreneur",
-            "onlinecourse",
+            "EntrepreneurRideAlong",
+            "onlinebusiness",
+            "coursecreators",
             "marketing",
             "SaaS",
-            "coursecreators",
-            "smallbusiness"
-          ]
-        },
-        "painSignalWords": {
-          "title": "🚨 Pain Signal Words",
-          "description": "Ako se bilo koja od ovih reči nađe u postu, post dobija viši pain score. Sve lowercase.",
-          "type": "array",
-          "editor": "stringList",
-          "default": [
-            "can't", "cannot", "broken", "doesn't work", "not working",
-            "frustrated", "struggling", "stuck", "problem", "issue",
-            "workaround", "manually", "limitation", "missing", "wish",
-            "nightmare", "annoying", "no way to", "impossible",
-            "ghost town", "nobody posts", "churn", "leaving", "cancel",
-            "rented land", "black box", "leaky bucket", "wasting",
-            "hours a week", "not scalable", "losing members"
+            "coaching",
+            "sidehustle"
           ]
         },
         "maxPostsPerSearch": {
-          "title": "📄 Max Posts Per Search",
+          "title": "📄 Max Posts Per Search Query",
           "type": "integer",
-          "default": 15,
-          "minimum": 5,
-          "maximum": 50
+          "description": "How many posts to fetch per keyword/subreddit combination. Max 100.",
+          "default": 100,
+          "minimum": 10,
+          "maximum": 100
         },
-        "minPainScore": {
-          "title": "📊 Minimum Pain Score (0–100)",
+        "minRelevanceScore": {
+          "title": "📊 Minimum Relevance Score (0–100)",
           "type": "integer",
-          "default": 20,
+          "description": "Posts below this score are discarded. 0 = keep all, 25 = creator/problem signal required, 50 = high confidence only.",
+          "default": 25,
           "minimum": 0,
           "maximum": 100
         },
-        "timeFilter": {
-          "title": "📅 Vremenski Filter",
-          "type": "string",
-          "editor": "select",
-          "enum": ["week", "month", "year", "all"],
-          "enumTitles": ["Prošla nedelja", "Prošli mesec", "Prošla godina", "Sve vreme"],
-          "default": "year"
+        "daysBack": {
+          "title": "📅 Days Back",
+          "type": "integer",
+          "description": "How many days back to search. 365 = last year, 730 = last 2 years.",
+          "default": 730,
+          "minimum": 30,
+          "maximum": 1825
         },
         "sortBy": {
-          "title": "🔃 Sortiraj Po",
+          "title": "🔃 Sort Results By",
           "type": "string",
           "editor": "select",
-          "enum": ["relevance", "top", "new", "comments"],
-          "enumTitles": ["Relevantnost", "Najviše glasova", "Najnovije", "Najviše komentara"],
-          "default": "relevance"
+          "enum": ["score", "num_comments", "created_utc"],
+          "enumTitles": ["Most upvoted", "Most commented", "Most recent"],
+          "default": "score"
         },
         "includeComments": {
-          "title": "💬 Uključi Top Komentare",
+          "title": "💬 Include Top Comments",
           "type": "boolean",
-          "description": "Scrapuj top komentare po postu za više VOC materijala.",
+          "description": "Fetch and score top comments for each relevant post.",
           "default": true
         },
+        "maxCommentsPerPost": {
+          "title": "💬 Max Comments Per Post",
+          "type": "integer",
+          "default": 50,
+          "minimum": 10,
+          "maximum": 100
+        },
         "proxyConfig": {
-          "title": "🔒 Proxy",
+          "title": "🔒 Proxy Configuration",
           "type": "object",
           "editor": "proxy",
-          "sectionCaption": "Proxy (RESIDENTIAL required without OAuth)",
           "default": {
             "useApifyProxy": true,
             "apifyProxyGroups": ["RESIDENTIAL"]

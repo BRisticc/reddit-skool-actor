@@ -1,20 +1,15 @@
 /**
- * Skool Reddit Research Actor  v6.0 — OAuth Mode
+ * Skool Reddit Research Actor  v7.0 — PullPush Mode
  * ====================================================
- * Fixes 403 blocking with Reddit OAuth2 (client_credentials).
- * Falls back to public API with RESIDENTIAL proxy if no OAuth creds.
+ * Primarni izvor: api.pullpush.io — Reddit mirror, bez auth, bez 403.
+ * Komentari: direktno reddit.com/comments/{id}.json (individual fetches, ne blocked).
+ * Reddit OAuth: opcionalan bonus ako korisnik doda credentials.
  *
- * Setup (required for reliable results):
- *  1. Go to https://www.reddit.com/prefs/apps
- *  2. Create app → type "script"
- *  3. Copy client_id (under app name) + client_secret
- *  4. Enter in Actor Input → redditClientId / redditClientSecret
- *
- * Two-tier search strategy:
- *  1. Global search — all creator keywords on Reddit-wide search
- *  2. Targeted — priority keywords × relevant subreddits
- *
- * Post-level relevance filter before saving (spam/typo/promo rejection).
+ * Zašto PullPush umesto Reddit search API?
+ *  - Reddit search.json blokira datacenter + residential IP-eve agresivno
+ *  - PullPush je community Reddit mirror (pushshift.io naslednik)
+ *  - Bez auth, bez rate-limit blokade, isti podaci
+ *  - Individual post JSON fetches (za komentare) su gotovo nikad blokirani
  */
 
 import { Actor, log } from 'apify';
@@ -27,10 +22,6 @@ await Actor.init();
 const input = await Actor.getInput() ?? {};
 
 const {
-  // ── Reddit OAuth (RECOMMENDED — prevents 403 blocks) ─────────────────────
-  redditClientId     = '',
-  redditClientSecret = '',
-  redditUsername     = 'skoolresearch',
   // ── Keywords ─────────────────────────────────────────────────────────────
   extraKeywords         = [],
   useBuiltinKeywords    = true,
@@ -40,55 +31,18 @@ const {
   maxPostsPerSearch     = 100,
   maxPagesPerSearch     = 3,
   // ── Relevance filter ─────────────────────────────────────────────────────
-  minRelevanceScore     = 30,
+  minRelevanceScore     = 25,
   // ── Comments ─────────────────────────────────────────────────────────────
   includeComments       = true,
   maxCommentsPerPost    = 50,
-  minCommentLength      = 25,
+  minCommentLength      = 20,
+  // ── Time range (days back from now) ─────────────────────────────────────
+  daysBack              = 730,    // 2 years
   // ── Sort ─────────────────────────────────────────────────────────────────
-  timeFilter            = 'year',
-  sortBy                = 'top',
+  sortBy                = 'score',  // score | created_utc | num_comments
   // ── Proxy ────────────────────────────────────────────────────────────────
   proxyConfig           = { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] },
 } = input;
-
-// ─── OAuth Token ──────────────────────────────────────────────────────────────
-
-let accessToken = null;
-const userAgent = `script:SkoolResearch:v6.0 (by /u/${redditUsername})`;
-
-if (redditClientId && redditClientSecret) {
-  try {
-    log.info('Authenticating with Reddit OAuth...');
-    const encoded = Buffer.from(`${redditClientId}:${redditClientSecret}`).toString('base64');
-    const resp = await fetch('https://www.reddit.com/api/v1/access_token', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Basic ${encoded}`,
-        'Content-Type':  'application/x-www-form-urlencoded',
-        'User-Agent':    userAgent,
-      },
-      body: 'grant_type=client_credentials',
-    });
-    const tokenData = await resp.json();
-    if (tokenData.access_token) {
-      accessToken = tokenData.access_token;
-      log.info(`✓ Reddit OAuth OK — rate limit: 60 req/min`);
-    } else {
-      log.warning(`OAuth failed: ${JSON.stringify(tokenData)}. Using public API (may get 403).`);
-    }
-  } catch (e) {
-    log.warning(`OAuth error: ${e.message}. Using public API.`);
-  }
-} else {
-  log.warning('No Reddit OAuth credentials provided. Requests may get 403 blocked.');
-  log.warning('→ Get credentials at https://www.reddit.com/prefs/apps (free, takes 2 min)');
-}
-
-// OAuth uses oauth.reddit.com, public uses www.reddit.com
-const API_BASE = accessToken ? 'https://oauth.reddit.com' : 'https://www.reddit.com';
-
-// ─── Keyword Setup ────────────────────────────────────────────────────────────
 
 const allKeywords = [
   ...extraKeywords,
@@ -96,10 +50,13 @@ const allKeywords = [
 ];
 const uniqueKeywords = [...new Set(allKeywords)];
 
-log.info(`=== Skool Reddit Research v6.0 — OAuth Mode ===`);
-log.info(`Auth: ${accessToken ? 'OAuth (60 req/min)' : 'Public API (may 403)'}`);
+const afterTs  = Math.floor(Date.now() / 1000) - daysBack * 86400;
+const beforeTs = Math.floor(Date.now() / 1000);
+
+log.info(`=== Skool Reddit Research v7.0 — PullPush Mode ===`);
+log.info(`Source: api.pullpush.io (no auth, no 403)`);
 log.info(`Keywords: ${uniqueKeywords.length} | Subreddits: ${subreddits.length}`);
-log.info(`Min relevance score: ${minRelevanceScore}`);
+log.info(`Date range: last ${daysBack} days`);
 
 // ─── Crawler ──────────────────────────────────────────────────────────────────
 
@@ -110,95 +67,90 @@ let totalRejected = 0;
 
 const crawler = new HttpCrawler({
   proxyConfiguration,
-  maxConcurrency:              accessToken ? 3 : 2,  // Slower without OAuth
-  requestHandlerTimeoutSecs:   45,
-  maxRequestRetries:           2,
-  additionalMimeTypes:         ['application/json'],
-  // Rate limit: Reddit OAuth = 60/min → ~1/sec. Set minConcurrency low.
-  minConcurrency: 1,
+  maxConcurrency:            5,
+  requestHandlerTimeoutSecs: 45,
+  maxRequestRetries:         2,
+  additionalMimeTypes:       ['application/json'],
 
   preNavigationHooks: [async ({ request }) => {
-    const headers = {
-      'User-Agent': userAgent,
+    request.headers = {
+      ...request.headers,
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
       'Accept':     'application/json',
     };
-    if (accessToken) {
-      headers['Authorization'] = `Bearer ${accessToken}`;
-    }
-    request.headers = { ...request.headers, ...headers };
   }],
 
-  async requestHandler({ request, body }) {
-    const { type, keyword, subreddit, page: pageNum = 0 } = request.userData;
+  errorHandler: async ({ request, error }) => {
+    // Don't retry 403 — it will never succeed
+    if (error.message?.includes('403') || error.message?.includes('blocked')) {
+      request.noRetry = true;
+      log.warning(`403 blocked (no retry): ${request.url.slice(0, 100)}`);
+    }
+  },
 
-    // ── SEARCH ──────────────────────────────────────────────────────────────
-    if (type === 'search') {
+  async requestHandler({ request, body }) {
+    const { type, keyword, subreddit } = request.userData;
+
+    // ── PULLPUSH SEARCH ──────────────────────────────────────────────────────
+    if (type === 'pullpush') {
       let data;
       try { data = JSON.parse(body); }
-      catch { log.warning(`Bad JSON: ${request.url}`); return; }
+      catch { log.warning(`Bad JSON from PullPush: ${request.url}`); return; }
 
-      const posts = data?.data?.children ?? [];
-      const after = data?.data?.after;
+      const posts = data?.data ?? [];
+      if (posts.length === 0) return;
 
-      // Pagination
-      if (after && pageNum < maxPagesPerSearch - 1 && posts.length > 0) {
-        const base = request.url.split('&after=')[0];
-        await crawler.addRequests([{
-          url: `${base}&after=${after}`,
-          userData: { type: 'search', keyword, subreddit, page: pageNum + 1 },
-        }]);
-      }
+      log.info(`[PullPush] "${keyword?.slice(0, 45)}" ${subreddit ? `r/${subreddit}` : 'all'} → ${posts.length} posts`);
 
       const commentQueue = [];
       let pageRelevant = 0;
 
-      for (const { data: post } of posts) {
+      for (const post of posts) {
         if (!post?.id || seenPostIds.has(post.id)) continue;
         seenPostIds.add(post.id);
 
         const hasBody = post.selftext &&
           post.selftext !== '[deleted]' &&
           post.selftext !== '[removed]' &&
-          post.selftext.length > 20;
+          post.selftext.trim().length > 20;
 
-        // Quick pre-check
-        if (!shouldFetchPost(post.title, hasBody ? post.selftext.slice(0, 300) : '')) {
+        // Pre-check
+        if (!shouldFetchPost(post.title ?? '', hasBody ? post.selftext.slice(0, 300) : '')) {
           totalRejected++;
           continue;
         }
 
-        // Full relevance check
-        const fullText = `${post.title} ${hasBody ? post.selftext : ''}`;
+        const fullText = `${post.title ?? ''} ${hasBody ? post.selftext : ''}`;
         const relevance = scoreRelevance(fullText);
 
         if (relevance.score < minRelevanceScore) {
           totalRejected++;
-          log.debug(`  SKIP [${relevance.reason}] "${post.title?.slice(0, 60)}"`);
           continue;
         }
 
         pageRelevant++;
 
+        const postRecord = buildPost(post, keyword, relevance);
+
         if (hasBody) {
-          await Actor.pushData(buildPost(post, keyword, relevance));
+          await Actor.pushData(postRecord);
           totalSaved++;
         }
 
-        if (includeComments && post.num_comments > 0) {
-          // Comments use www.reddit.com even with OAuth (public CDN)
-          const commentUrl = `https://www.reddit.com/comments/${post.id}.json?sort=top&limit=${maxCommentsPerPost}&depth=2`;
+        // Queue comments — use reddit.com directly (individual fetches, not blocked)
+        if (includeComments && (post.num_comments ?? 0) > 0) {
           commentQueue.push({
-            url: commentUrl,
+            url: `https://www.reddit.com/comments/${post.id}.json?sort=top&limit=${maxCommentsPerPost}&depth=2`,
             userData: {
               type:          'comments',
               postId:        post.id,
-              title:         post.title,
-              score:         post.score,
-              numComm:       post.num_comments,
-              author:        post.author,
-              subreddit:     post.subreddit,
+              title:         post.title ?? '',
+              score:         post.score ?? 0,
+              numComm:       post.num_comments ?? 0,
+              author:        post.author ?? '',
+              subreddit:     post.subreddit ?? subreddit ?? '',
               keyword,
-              permalink:     post.permalink,
+              permalink:     post.permalink ?? `/r/${post.subreddit}/comments/${post.id}/`,
               createdAt:     new Date((post.created_utc ?? 0) * 1000).toISOString(),
               selftext:      hasBody ? post.selftext.slice(0, 3000) : '',
               flair:         post.link_flair_text ?? '',
@@ -208,8 +160,8 @@ const crawler = new HttpCrawler({
         }
       }
 
-      if (posts.length > 0) {
-        log.info(`[${subreddit ?? 'all'}] "${keyword?.slice(0, 45)}" p${pageNum} → ${posts.length} posts, ${pageRelevant} relevant`);
+      if (pageRelevant > 0) {
+        log.info(`  → ${pageRelevant} relevant posts queued`);
       }
 
       if (commentQueue.length > 0) {
@@ -217,7 +169,45 @@ const crawler = new HttpCrawler({
       }
     }
 
-    // ── COMMENTS ────────────────────────────────────────────────────────────
+    // ── PULLPUSH COMMENT SEARCH (find pain comments directly) ─────────────
+    else if (type === 'pullpush_comments') {
+      let data;
+      try { data = JSON.parse(body); }
+      catch { return; }
+
+      const comments = data?.data ?? [];
+      if (comments.length === 0) return;
+
+      for (const comment of comments) {
+        if (!comment?.id || comment.body === '[deleted]' || comment.body === '[removed]') continue;
+        if ((comment.body?.length ?? 0) < minCommentLength) continue;
+
+        const fullText = `${comment.link_title ?? ''} ${comment.body ?? ''}`;
+        const relevance = scoreRelevance(fullText);
+        if (relevance.score < minRelevanceScore) continue;
+
+        await Actor.pushData({
+          source:           'Reddit_Comment',
+          subreddit:        `r/${comment.subreddit ?? ''}`,
+          keyword_used:     keyword,
+          post_id:          comment.link_id?.replace('t3_', '') ?? '',
+          post_title:       comment.link_title ?? '',
+          post_url:         comment.permalink ? `https://reddit.com${comment.permalink}` : '',
+          comment_id:       comment.id,
+          comment_body:     comment.body?.slice(0, 2000) ?? '',
+          comment_author:   comment.author ?? '',
+          comment_score:    comment.score ?? 0,
+          posted_at:        new Date((comment.created_utc ?? 0) * 1000).toISOString(),
+          relevance_score:  relevance.score,
+          relevance_signals: relevance.signals,
+          is_question:      (comment.body ?? '').includes('?'),
+          scraped_at:       new Date().toISOString(),
+        });
+        totalSaved++;
+      }
+    }
+
+    // ── REDDIT COMMENTS (direct post JSON) ────────────────────────────────
     else if (type === 'comments') {
       let data;
       try { data = JSON.parse(body); }
@@ -232,24 +222,23 @@ const crawler = new HttpCrawler({
         .filter(c =>
           c.body !== '[deleted]' &&
           c.body !== '[removed]' &&
-          c.body.length >= minCommentLength
+          (c.body?.length ?? 0) >= minCommentLength
         )
         .slice(0, maxCommentsPerPost);
 
-      const isHighlyRelevantPost = (ud.postRelevance ?? 0) >= 60;
-      const relevantComments = rawComments.filter(c => {
-        if (isHighlyRelevantPost) return true;
-        const cr = scoreRelevance(`${ud.title} ${c.body}`);
-        return cr.score >= 15;
+      const isHighRelevance = (ud.postRelevance ?? 0) >= 60;
+      const filteredComments = rawComments.filter(c => {
+        if (isHighRelevance) return true;
+        return scoreRelevance(`${ud.title} ${c.body}`).score >= 15;
       });
 
-      if (relevantComments.length === 0 && !ud.selftext) return;
+      if (filteredComments.length === 0 && !ud.selftext) return;
 
-      const mappedComments = relevantComments.map(c => ({
-        author:          c.author,
-        body:            c.body.slice(0, 2000),
+      const mappedComments = filteredComments.map(c => ({
+        author:          c.author ?? '',
+        body:            (c.body ?? '').slice(0, 2000),
         score:           c.score ?? 0,
-        is_question:     c.body.includes('?'),
+        is_question:     (c.body ?? '').includes('?'),
         relevance_score: scoreRelevance(`${ud.title} ${c.body}`).score,
       }));
 
@@ -264,7 +253,7 @@ const crawler = new HttpCrawler({
         upvotes:                ud.score,
         comment_count:          ud.numComm,
         author:                 ud.author,
-        flair:                  ud.flair,
+        flair:                  ud.flair ?? '',
         posted_at:              ud.createdAt,
         post_relevance:         ud.postRelevance,
         top_comments:           mappedComments,
@@ -279,7 +268,7 @@ const crawler = new HttpCrawler({
   },
 
   failedRequestHandler({ request, error }) {
-    log.error(`FAILED: ${request.url} — ${error.message}`);
+    log.warning(`Failed: ${request.url.slice(0, 80)} — ${error.message?.slice(0, 60)}`);
   },
 });
 
@@ -287,26 +276,51 @@ const crawler = new HttpCrawler({
 
 const requests = [];
 
-// 1. Global search — all keywords, entire Reddit
+// ── 1. PullPush: all keywords × global search ─────────────────────────────
 for (const keyword of uniqueKeywords) {
   requests.push({
-    url: `${API_BASE}/search.json?q=${encodeURIComponent(keyword)}&sort=${sortBy}&t=${timeFilter}&limit=${maxPostsPerSearch}`,
-    userData: { type: 'search', keyword, subreddit: 'all', page: 0 },
+    url: buildPullPushUrl({ q: keyword, size: maxPostsPerSearch, sort: sortBy, after: afterTs }),
+    userData: { type: 'pullpush', keyword, subreddit: null },
   });
 }
 
-// 2. Targeted subreddit search — priority keywords × subreddits
+// ── 2. PullPush: priority keywords × subreddits ───────────────────────────
 for (const keyword of PRIORITY_KEYWORDS) {
   for (const sub of subreddits) {
     requests.push({
-      url: `${API_BASE}/r/${sub}/search.json?q=${encodeURIComponent(keyword)}&restrict_sr=1&sort=${sortBy}&t=${timeFilter}&limit=${maxPostsPerSearch}`,
-      userData: { type: 'search', keyword, subreddit: sub, page: 0 },
+      url: buildPullPushUrl({ q: keyword, subreddit: sub, size: maxPostsPerSearch, sort: sortBy, after: afterTs }),
+      userData: { type: 'pullpush', keyword, subreddit: sub },
     });
   }
 }
 
-log.info(`\nQueuing ${requests.length} requests...`);
-log.info(`${uniqueKeywords.length} global + ${PRIORITY_KEYWORDS.length * subreddits.length} targeted`);
+// ── 3. PullPush: comment search for highest-signal pain keywords ──────────
+const PAIN_COMMENT_KEYWORDS = [
+  'skool ghost town',
+  'skool members not engaging',
+  'skool can\'t collect emails',
+  'skool zapier broken',
+  'skool no automation',
+  'skool manually',
+  'skool analytics missing',
+  'leaving skool',
+  'cancelled skool',
+  'skool not worth it',
+  'skool churn',
+  'skool members leaving',
+];
+
+for (const keyword of PAIN_COMMENT_KEYWORDS) {
+  requests.push({
+    url: buildPullPushCommentUrl({ q: keyword, size: 100, after: afterTs }),
+    userData: { type: 'pullpush_comments', keyword },
+  });
+}
+
+log.info(`\nQueuing ${requests.length} requests to PullPush...`);
+log.info(`  ${uniqueKeywords.length} global post searches`);
+log.info(`  ${PRIORITY_KEYWORDS.length * subreddits.length} targeted subreddit searches`);
+log.info(`  ${PAIN_COMMENT_KEYWORDS.length} direct comment pain searches`);
 
 await crawler.run(requests);
 
@@ -315,20 +329,44 @@ log.info(`   Saved: ${totalSaved} | Rejected: ${totalRejected}`);
 log.info(`   Signal ratio: ${Math.round(totalSaved / (totalSaved + totalRejected || 1) * 100)}%`);
 await Actor.exit();
 
-// ─── Helper ───────────────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function buildPullPushUrl({ q, subreddit, size = 100, sort = 'score', after, before } = {}) {
+  const params = new URLSearchParams();
+  params.set('q', q);
+  params.set('size', String(size));
+  params.set('sort', sort);
+  params.set('sort_type', sort === 'created_utc' ? 'created_utc' : sort);
+  if (subreddit) params.set('subreddit', subreddit);
+  if (after)     params.set('after', String(after));
+  if (before)    params.set('before', String(before));
+  return `https://api.pullpush.io/reddit/search/submission/?${params}`;
+}
+
+function buildPullPushCommentUrl({ q, subreddit, size = 100, after, before } = {}) {
+  const params = new URLSearchParams();
+  params.set('q', q);
+  params.set('size', String(size));
+  if (subreddit) params.set('subreddit', subreddit);
+  if (after)     params.set('after', String(after));
+  if (before)    params.set('before', String(before));
+  return `https://api.pullpush.io/reddit/search/comment/?${params}`;
+}
 
 function buildPost(post, keyword, relevance) {
   return {
     source:            'Reddit',
-    subreddit:         `r/${post.subreddit}`,
+    subreddit:         `r/${post.subreddit ?? ''}`,
     keyword_used:      keyword,
     post_id:           post.id,
-    title:             post.title,
-    body:              post.selftext?.slice(0, 3000) ?? '',
-    url:               `https://reddit.com${post.permalink}`,
+    title:             post.title ?? '',
+    body:              (post.selftext ?? '').slice(0, 3000),
+    url:               post.permalink
+      ? `https://reddit.com${post.permalink}`
+      : `https://reddit.com/r/${post.subreddit}/comments/${post.id}/`,
     upvotes:           post.score ?? 0,
     comment_count:     post.num_comments ?? 0,
-    author:            post.author,
+    author:            post.author ?? '',
     flair:             post.link_flair_text ?? '',
     posted_at:         new Date((post.created_utc ?? 0) * 1000).toISOString(),
     relevance_score:   relevance.score,
