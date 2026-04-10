@@ -1,0 +1,135 @@
+{
+  "name": "skool-reddit-research-actor",
+  "version": "2.0.0",
+  "description": "Scrapes Reddit for Skool community pain points. All keywords editable from Input tab.",
+  "main": "src/main.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/main.js"
+  },
+  "dependencies": {
+    "apify": "^3.7.0",
+    "crawlee": "^3.16.0",
+    "puppeteer": "*"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "apify": {
+    "title": "Skool — Reddit VOC Research",
+    "description": "Mines Reddit for authentic Skool community pain language. All keywords, subreddits, and filters editable from Input tab. No AI required.",
+    "version": "2.0.0",
+    "inputSchema": {
+      "title": "Skool Reddit Research",
+      "type": "object",
+      "schemaVersion": 1,
+      "properties": {
+        "searchKeywords": {
+          "title": "🔍 Search Keywords",
+          "type": "array",
+          "description": "Šta da traži na Redditu. Misli kao tvoj ICP — šta bi oni ukucali u search.",
+          "editor": "stringList",
+          "default": [
+            "skool community members not engaging",
+            "skool nobody posts in my community",
+            "skool email collection how to",
+            "skool zapier integration problem",
+            "skool members leaving churn",
+            "skool free to paid conversion",
+            "skool automation missing",
+            "skool analytics reporting",
+            "skool platform limitations",
+            "skool funnel setup",
+            "skool onboarding new members",
+            "skool retention strategy",
+            "skool community ghost town",
+            "skool crm integration",
+            "skool member engagement tips"
+          ]
+        },
+        "extraKeywords": {
+          "title": "➕ Extra Keywords (dodaj bez brisanja defaulta)",
+          "type": "array",
+          "description": "Testuj nove search termine bez menjanja glavne liste.",
+          "editor": "stringList",
+          "default": []
+        },
+        "subreddits": {
+          "title": "📋 Subreddits",
+          "type": "array",
+          "description": "Koji subreddits da pretražuje.",
+          "editor": "stringList",
+          "default": [
+            "skool",
+            "entrepreneur",
+            "onlinecourse",
+            "marketing",
+            "SaaS",
+            "coursecreators",
+            "smallbusiness"
+          ]
+        },
+        "painSignalWords": {
+          "title": "🚨 Pain Signal Words",
+          "description": "Ako se bilo koja od ovih reči nađe u postu, post dobija viši pain score. Sve lowercase.",
+          "type": "array",
+          "editor": "stringList",
+          "default": [
+            "can't", "cannot", "broken", "doesn't work", "not working",
+            "frustrated", "struggling", "stuck", "problem", "issue",
+            "workaround", "manually", "limitation", "missing", "wish",
+            "nightmare", "annoying", "no way to", "impossible",
+            "ghost town", "nobody posts", "churn", "leaving", "cancel",
+            "rented land", "black box", "leaky bucket", "wasting",
+            "hours a week", "not scalable", "losing members"
+          ]
+        },
+        "maxPostsPerSearch": {
+          "title": "📄 Max Posts Per Search",
+          "type": "integer",
+          "default": 15,
+          "minimum": 5,
+          "maximum": 50
+        },
+        "minPainScore": {
+          "title": "📊 Minimum Pain Score (0–100)",
+          "type": "integer",
+          "default": 20,
+          "minimum": 0,
+          "maximum": 100
+        },
+        "timeFilter": {
+          "title": "📅 Vremenski Filter",
+          "type": "string",
+          "editor": "select",
+          "enum": ["week", "month", "year", "all"],
+          "enumTitles": ["Prošla nedelja", "Prošli mesec", "Prošla godina", "Sve vreme"],
+          "default": "year"
+        },
+        "sortBy": {
+          "title": "🔃 Sortiraj Po",
+          "type": "string",
+          "editor": "select",
+          "enum": ["relevance", "top", "new", "comments"],
+          "enumTitles": ["Relevantnost", "Najviše glasova", "Najnovije", "Najviše komentara"],
+          "default": "relevance"
+        },
+        "includeComments": {
+          "title": "💬 Uključi Top Komentare",
+          "type": "boolean",
+          "description": "Scrapuj top komentare po postu za više VOC materijala.",
+          "default": true
+        },
+        "proxyConfig": {
+          "title": "🔒 Proxy",
+          "type": "object",
+          "editor": "proxy",
+          "default": {
+            "useApifyProxy": true,
+            "apifyProxyGroups": ["RESIDENTIAL"]
+          }
+        }
+      }
+    }
+  }
+}
