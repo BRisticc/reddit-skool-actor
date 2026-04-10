@@ -23,6 +23,28 @@
       "type": "object",
       "schemaVersion": 1,
       "properties": {
+        "redditClientId": {
+          "title": "🔑 Reddit Client ID (OAuth)",
+          "type": "string",
+          "description": "Required to avoid 403 blocks. Get free credentials: reddit.com/prefs/apps → Create App → Script type. Copy the ID shown under the app name.",
+          "editor": "textfield",
+          "default": ""
+        },
+        "redditClientSecret": {
+          "title": "🔒 Reddit Client Secret (OAuth)",
+          "type": "string",
+          "description": "The 'secret' field from your Reddit app. Without this, requests will be blocked.",
+          "editor": "textfield",
+          "isSecret": true,
+          "default": ""
+        },
+        "redditUsername": {
+          "title": "👤 Your Reddit Username",
+          "type": "string",
+          "description": "Your Reddit username (without u/). Used in User-Agent string as required by Reddit API rules.",
+          "editor": "textfield",
+          "default": "skoolresearch"
+        },
         "searchKeywords": {
           "title": "🔍 Search Keywords",
           "type": "array",
@@ -123,6 +145,7 @@
           "title": "🔒 Proxy",
           "type": "object",
           "editor": "proxy",
+          "sectionCaption": "Proxy (RESIDENTIAL required without OAuth)",
           "default": {
             "useApifyProxy": true,
             "apifyProxyGroups": ["RESIDENTIAL"]

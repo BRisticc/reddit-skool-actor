@@ -1,14 +1,20 @@
 /**
- * Skool Reddit Research Actor  v5.0 — Precision Mode
+ * Skool Reddit Research Actor  v6.0 — OAuth Mode
  * ====================================================
- * Fokus: samo kreatori koji imaju PROBLEM sa Skool platformom.
- * Odbacuje: promo, affiliate, "school" typo, irelevantne postove.
+ * Fixes 403 blocking with Reddit OAuth2 (client_credentials).
+ * Falls back to public API with RESIDENTIAL proxy if no OAuth creds.
  *
- * Dvoslojna zaštita od šuma:
- *  1. Precizni creator-focused keywords (ne broad "skool")
- *  2. Post-level relevance filter — svaki post se scoruje pre čuvanja
+ * Setup (required for reliable results):
+ *  1. Go to https://www.reddit.com/prefs/apps
+ *  2. Create app → type "script"
+ *  3. Copy client_id (under app name) + client_secret
+ *  4. Enter in Actor Input → redditClientId / redditClientSecret
  *
- * API: Reddit JSON API (HttpCrawler, bez browsera)
+ * Two-tier search strategy:
+ *  1. Global search — all creator keywords on Reddit-wide search
+ *  2. Targeted — priority keywords × relevant subreddits
+ *
+ * Post-level relevance filter before saving (spam/typo/promo rejection).
  */
 
 import { Actor, log } from 'apify';
@@ -21,40 +27,81 @@ await Actor.init();
 const input = await Actor.getInput() ?? {};
 
 const {
-  // Keywords
+  // ── Reddit OAuth (RECOMMENDED — prevents 403 blocks) ─────────────────────
+  redditClientId     = '',
+  redditClientSecret = '',
+  redditUsername     = 'skoolresearch',
+  // ── Keywords ─────────────────────────────────────────────────────────────
   extraKeywords         = [],
   useBuiltinKeywords    = true,
-  // Subreddits
+  // ── Subreddits ────────────────────────────────────────────────────────────
   subreddits            = CREATOR_SUBREDDITS,
-  // Collection settings
+  // ── Collection settings ───────────────────────────────────────────────────
   maxPostsPerSearch     = 100,
   maxPagesPerSearch     = 3,
-  // Relevance filter
-  minRelevanceScore     = 30,     // 0 = čuvaj sve, 30 = creator/problem signal required
-  // Comments
+  // ── Relevance filter ─────────────────────────────────────────────────────
+  minRelevanceScore     = 30,
+  // ── Comments ─────────────────────────────────────────────────────────────
   includeComments       = true,
-  maxCommentsPerPost    = 30,
+  maxCommentsPerPost    = 50,
   minCommentLength      = 25,
-  // Sort
+  // ── Sort ─────────────────────────────────────────────────────────────────
   timeFilter            = 'year',
   sortBy                = 'top',
-  // Proxy
-  proxyConfig           = { useApifyProxy: true },
+  // ── Proxy ────────────────────────────────────────────────────────────────
+  proxyConfig           = { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] },
 } = input;
+
+// ─── OAuth Token ──────────────────────────────────────────────────────────────
+
+let accessToken = null;
+const userAgent = `script:SkoolResearch:v6.0 (by /u/${redditUsername})`;
+
+if (redditClientId && redditClientSecret) {
+  try {
+    log.info('Authenticating with Reddit OAuth...');
+    const encoded = Buffer.from(`${redditClientId}:${redditClientSecret}`).toString('base64');
+    const resp = await fetch('https://www.reddit.com/api/v1/access_token', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${encoded}`,
+        'Content-Type':  'application/x-www-form-urlencoded',
+        'User-Agent':    userAgent,
+      },
+      body: 'grant_type=client_credentials',
+    });
+    const tokenData = await resp.json();
+    if (tokenData.access_token) {
+      accessToken = tokenData.access_token;
+      log.info(`✓ Reddit OAuth OK — rate limit: 60 req/min`);
+    } else {
+      log.warning(`OAuth failed: ${JSON.stringify(tokenData)}. Using public API (may get 403).`);
+    }
+  } catch (e) {
+    log.warning(`OAuth error: ${e.message}. Using public API.`);
+  }
+} else {
+  log.warning('No Reddit OAuth credentials provided. Requests may get 403 blocked.');
+  log.warning('→ Get credentials at https://www.reddit.com/prefs/apps (free, takes 2 min)');
+}
+
+// OAuth uses oauth.reddit.com, public uses www.reddit.com
+const API_BASE = accessToken ? 'https://oauth.reddit.com' : 'https://www.reddit.com';
+
+// ─── Keyword Setup ────────────────────────────────────────────────────────────
 
 const allKeywords = [
   ...extraKeywords,
   ...(useBuiltinKeywords ? CREATOR_KEYWORDS : []),
 ];
-
 const uniqueKeywords = [...new Set(allKeywords)];
 
-log.info(`=== Skool Reddit Research v5.0 — Precision Mode ===`);
+log.info(`=== Skool Reddit Research v6.0 — OAuth Mode ===`);
+log.info(`Auth: ${accessToken ? 'OAuth (60 req/min)' : 'Public API (may 403)'}`);
 log.info(`Keywords: ${uniqueKeywords.length} | Subreddits: ${subreddits.length}`);
 log.info(`Min relevance score: ${minRelevanceScore}`);
-log.info(`Strategy: ${PRIORITY_KEYWORDS.length} priority keywords × ${subreddits.length} subreddits + all keywords globally`);
 
-// ─── Crawler ─────────────────────────────────────────────────────────────────
+// ─── Crawler ──────────────────────────────────────────────────────────────────
 
 const proxyConfiguration = await Actor.createProxyConfiguration(proxyConfig);
 const seenPostIds = new Set();
@@ -63,23 +110,28 @@ let totalRejected = 0;
 
 const crawler = new HttpCrawler({
   proxyConfiguration,
-  maxConcurrency: 4,
-  requestHandlerTimeoutSecs: 30,
-  maxRequestRetries: 3,
-  additionalMimeTypes: ['application/json'],
+  maxConcurrency:              accessToken ? 3 : 2,  // Slower without OAuth
+  requestHandlerTimeoutSecs:   45,
+  maxRequestRetries:           2,
+  additionalMimeTypes:         ['application/json'],
+  // Rate limit: Reddit OAuth = 60/min → ~1/sec. Set minConcurrency low.
+  minConcurrency: 1,
 
   preNavigationHooks: [async ({ request }) => {
-    request.headers = {
-      ...request.headers,
-      'User-Agent': 'Mozilla/5.0 (compatible; SkoolResearch/5.0)',
-      'Accept': 'application/json',
+    const headers = {
+      'User-Agent': userAgent,
+      'Accept':     'application/json',
     };
+    if (accessToken) {
+      headers['Authorization'] = `Bearer ${accessToken}`;
+    }
+    request.headers = { ...request.headers, ...headers };
   }],
 
   async requestHandler({ request, body }) {
     const { type, keyword, subreddit, page: pageNum = 0 } = request.userData;
 
-    // ── SEARCH ────────────────────────────────────────────────────────────────
+    // ── SEARCH ──────────────────────────────────────────────────────────────
     if (type === 'search') {
       let data;
       try { data = JSON.parse(body); }
@@ -91,7 +143,7 @@ const crawler = new HttpCrawler({
       // Pagination
       if (after && pageNum < maxPagesPerSearch - 1 && posts.length > 0) {
         const base = request.url.split('&after=')[0];
-        await Actor.addRequests([{
+        await crawler.addRequests([{
           url: `${base}&after=${after}`,
           userData: { type: 'search', keyword, subreddit, page: pageNum + 1 },
         }]);
@@ -109,14 +161,13 @@ const crawler = new HttpCrawler({
           post.selftext !== '[removed]' &&
           post.selftext.length > 20;
 
-        // Quick relevance pre-check from title + preview
-        const previewText = `${post.title} ${hasBody ? post.selftext.slice(0, 300) : ''}`;
+        // Quick pre-check
         if (!shouldFetchPost(post.title, hasBody ? post.selftext.slice(0, 300) : '')) {
           totalRejected++;
           continue;
         }
 
-        // Full relevance check on available text
+        // Full relevance check
         const fullText = `${post.title} ${hasBody ? post.selftext : ''}`;
         const relevance = scoreRelevance(fullText);
 
@@ -129,27 +180,28 @@ const crawler = new HttpCrawler({
         pageRelevant++;
 
         if (hasBody) {
-          await Actor.pushData(buildPost(post, keyword, subreddit, relevance));
+          await Actor.pushData(buildPost(post, keyword, relevance));
           totalSaved++;
         }
 
-        // Queue for comments (will do full relevance check on comments too)
         if (includeComments && post.num_comments > 0) {
+          // Comments use www.reddit.com even with OAuth (public CDN)
+          const commentUrl = `https://www.reddit.com/comments/${post.id}.json?sort=top&limit=${maxCommentsPerPost}&depth=2`;
           commentQueue.push({
-            url: `https://www.reddit.com/comments/${post.id}.json?sort=top&limit=${maxCommentsPerPost}&depth=2`,
+            url: commentUrl,
             userData: {
-              type:         'comments',
-              postId:       post.id,
-              title:        post.title,
-              score:        post.score,
-              numComm:      post.num_comments,
-              author:       post.author,
-              subreddit:    post.subreddit,
+              type:          'comments',
+              postId:        post.id,
+              title:         post.title,
+              score:         post.score,
+              numComm:       post.num_comments,
+              author:        post.author,
+              subreddit:     post.subreddit,
               keyword,
-              permalink:    post.permalink,
-              createdAt:    new Date((post.created_utc ?? 0) * 1000).toISOString(),
-              selftext:     hasBody ? post.selftext.slice(0, 3000) : '',
-              flair:        post.link_flair_text ?? '',
+              permalink:     post.permalink,
+              createdAt:     new Date((post.created_utc ?? 0) * 1000).toISOString(),
+              selftext:      hasBody ? post.selftext.slice(0, 3000) : '',
+              flair:         post.link_flair_text ?? '',
               postRelevance: relevance.score,
             },
           });
@@ -161,11 +213,11 @@ const crawler = new HttpCrawler({
       }
 
       if (commentQueue.length > 0) {
-        await Actor.addRequests(commentQueue);
+        await crawler.addRequests(commentQueue);
       }
     }
 
-    // ── COMMENTS ──────────────────────────────────────────────────────────────
+    // ── COMMENTS ────────────────────────────────────────────────────────────
     else if (type === 'comments') {
       let data;
       try { data = JSON.parse(body); }
@@ -184,47 +236,45 @@ const crawler = new HttpCrawler({
         )
         .slice(0, maxCommentsPerPost);
 
-      // Filter comments for relevance too
-      // Exception: if the post itself was highly relevant, keep all comments (they provide context)
       const isHighlyRelevantPost = (ud.postRelevance ?? 0) >= 60;
       const relevantComments = rawComments.filter(c => {
-        if (isHighlyRelevantPost) return true; // Keep all comments on high-relevance posts
-        const cr = scoreRelevance(`${ud.title} ${c.body}`); // Include post title for context
-        return cr.score >= 15; // Lower threshold for comments (they're shorter)
+        if (isHighlyRelevantPost) return true;
+        const cr = scoreRelevance(`${ud.title} ${c.body}`);
+        return cr.score >= 15;
       });
 
       if (relevantComments.length === 0 && !ud.selftext) return;
 
       const mappedComments = relevantComments.map(c => ({
         author:          c.author,
-        body:            c.body.slice(0, 1500),
+        body:            c.body.slice(0, 2000),
         score:           c.score ?? 0,
         is_question:     c.body.includes('?'),
         relevance_score: scoreRelevance(`${ud.title} ${c.body}`).score,
       }));
 
       await Actor.pushData({
-        source:             'Reddit',
-        subreddit:          `r/${ud.subreddit}`,
-        keyword_used:       ud.keyword,
-        post_id:            ud.postId,
-        title:              ud.title,
-        body:               ud.selftext ?? '',
-        url:                `https://reddit.com${ud.permalink}`,
-        upvotes:            ud.score,
-        comment_count:      ud.numComm,
-        author:             ud.author,
-        flair:              ud.flair,
-        posted_at:          ud.createdAt,
-        post_relevance:     ud.postRelevance,
-        top_comments:       mappedComments,
+        source:                 'Reddit',
+        subreddit:              `r/${ud.subreddit}`,
+        keyword_used:           ud.keyword,
+        post_id:                ud.postId,
+        title:                  ud.title,
+        body:                   ud.selftext ?? '',
+        url:                    `https://reddit.com${ud.permalink}`,
+        upvotes:                ud.score,
+        comment_count:          ud.numComm,
+        author:                 ud.author,
+        flair:                  ud.flair,
+        posted_at:              ud.createdAt,
+        post_relevance:         ud.postRelevance,
+        top_comments:           mappedComments,
         relevant_comment_count: mappedComments.length,
-        has_questions:      mappedComments.some(c => c.is_question),
-        scraped_at:         new Date().toISOString(),
+        has_questions:          mappedComments.some(c => c.is_question),
+        scraped_at:             new Date().toISOString(),
       });
 
       totalSaved++;
-      log.info(`  ✓ r/${ud.subreddit} | ${mappedComments.length} relevant comments | "${ud.title?.slice(0, 55)}"`);
+      log.info(`  ✓ r/${ud.subreddit} | ${mappedComments.length} comments | "${ud.title?.slice(0, 55)}"`);
     }
   },
 
@@ -237,51 +287,52 @@ const crawler = new HttpCrawler({
 
 const requests = [];
 
-// 1. Global search — svi keywords pretražuju ceo Reddit
+// 1. Global search — all keywords, entire Reddit
 for (const keyword of uniqueKeywords) {
   requests.push({
-    url: `https://www.reddit.com/search.json?q=${encodeURIComponent(keyword)}&sort=${sortBy}&t=${timeFilter}&limit=${maxPostsPerSearch}`,
+    url: `${API_BASE}/search.json?q=${encodeURIComponent(keyword)}&sort=${sortBy}&t=${timeFilter}&limit=${maxPostsPerSearch}`,
     userData: { type: 'search', keyword, subreddit: 'all', page: 0 },
   });
 }
 
-// 2. Targeted subreddit search — PRIORITY keywords × relevantni subredditi
+// 2. Targeted subreddit search — priority keywords × subreddits
 for (const keyword of PRIORITY_KEYWORDS) {
-  for (const subreddit of subreddits) {
+  for (const sub of subreddits) {
     requests.push({
-      url: `https://www.reddit.com/r/${subreddit}/search.json?q=${encodeURIComponent(keyword)}&restrict_sr=1&sort=${sortBy}&t=${timeFilter}&limit=${maxPostsPerSearch}`,
-      userData: { type: 'search', keyword, subreddit, page: 0 },
+      url: `${API_BASE}/r/${sub}/search.json?q=${encodeURIComponent(keyword)}&restrict_sr=1&sort=${sortBy}&t=${timeFilter}&limit=${maxPostsPerSearch}`,
+      userData: { type: 'search', keyword, subreddit: sub, page: 0 },
     });
   }
 }
 
 log.info(`\nQueuing ${requests.length} requests...`);
-log.info(`Expected: ${uniqueKeywords.length} global + ${PRIORITY_KEYWORDS.length * subreddits.length} targeted`);
+log.info(`${uniqueKeywords.length} global + ${PRIORITY_KEYWORDS.length * subreddits.length} targeted`);
+
 await crawler.run(requests);
 
 log.info(`\n✅ Done.`);
-log.info(`   Saved: ${totalSaved} | Rejected as irrelevant: ${totalRejected}`);
-log.info(`   Signal ratio: ${totalSaved}/${totalSaved + totalRejected} (${Math.round(totalSaved / (totalSaved + totalRejected || 1) * 100)}%)`);
+log.info(`   Saved: ${totalSaved} | Rejected: ${totalRejected}`);
+log.info(`   Signal ratio: ${Math.round(totalSaved / (totalSaved + totalRejected || 1) * 100)}%`);
 await Actor.exit();
 
 // ─── Helper ───────────────────────────────────────────────────────────────────
 
-function buildPost(post, keyword, _subreddit, relevance) {
+function buildPost(post, keyword, relevance) {
   return {
-    source:           'Reddit',
-    subreddit:        `r/${post.subreddit}`,
-    keyword_used:     keyword,
-    post_id:          post.id,
-    title:            post.title,
-    body:             post.selftext?.slice(0, 3000) ?? '',
-    url:              `https://reddit.com${post.permalink}`,
-    upvotes:          post.score ?? 0,
-    comment_count:    post.num_comments ?? 0,
-    author:           post.author,
-    flair:            post.link_flair_text ?? '',
-    posted_at:        new Date((post.created_utc ?? 0) * 1000).toISOString(),
-    relevance_score:  relevance.score,
+    source:            'Reddit',
+    subreddit:         `r/${post.subreddit}`,
+    keyword_used:      keyword,
+    post_id:           post.id,
+    title:             post.title,
+    body:              post.selftext?.slice(0, 3000) ?? '',
+    url:               `https://reddit.com${post.permalink}`,
+    upvotes:           post.score ?? 0,
+    comment_count:     post.num_comments ?? 0,
+    author:            post.author,
+    flair:             post.link_flair_text ?? '',
+    posted_at:         new Date((post.created_utc ?? 0) * 1000).toISOString(),
+    relevance_score:   relevance.score,
     relevance_signals: relevance.signals,
-    scraped_at:       new Date().toISOString(),
+    scraped_at:        new Date().toISOString(),
   };
 }
