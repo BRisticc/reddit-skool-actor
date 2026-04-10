@@ -1,117 +1,124 @@
 /**
- * Skool Reddit Research Actor  v3.0
+ * Skool Reddit Research Actor  v4.0
  * ====================================
- * Koristi Reddit JSON API — NEMA Puppeteer, nema brsuzera.
- * 100 postova po requestu, pagination, 25 keywords × 15 subreddits.
- * Nema pain score filtera pri kolekciji — sve se čuva, analiza posle.
+ * Reddit JSON API — zero browsers, masivno skalabilno.
+ *
+ * Strategija:
+ *  1. GLOBAL search — svi 1000+ keywords pretražuju ceo Reddit
+ *  2. TARGETED search — 50 priority keywords × 80+ subreddits (restrict_sr=1)
+ *  3. Komentari se uzimaju direktno iz JSON-a
+ *  4. Nema filtera pri kolekciji — sve se čuva
+ *  5. Pagination — do N stranica po queriju
  */
 
 import { Actor, log } from 'apify';
 import { HttpCrawler } from 'crawlee';
+import { generateKeywords, SUBREDDITS, PRIORITY_KEYWORDS } from './keywords.js';
 
 await Actor.init();
 
 const input = await Actor.getInput() ?? {};
 
 const {
-  keywords = [
-    // Branded - direktno
-    'skool.com', 'skool community platform', 'skool review',
-    'skool worth it', 'skool pricing', 'skool problems',
-    // Comparisons - competitor intent
-    'skool vs kajabi', 'skool vs circle', 'skool vs mighty networks',
-    'skool vs teachable', 'skool vs discord', 'skool vs facebook groups',
-    'skool alternative', 'kajabi vs skool', 'circle vs skool',
-    // Pain points - operational
-    'skool members not engaging', 'skool ghost town', 'skool churn',
-    'skool email list', 'skool zapier', 'skool automation',
-    'skool analytics', 'skool limitations', 'skool not working',
-    // Influencer / brand
-    'skool sam ovens', 'skool alex hormozi', 'skool games leaderboard',
-    'skool affiliate program', 'skool community growth',
-    // Generic community pain (catches non-branded discussions)
-    'online community platform problems', 'membership site churn',
-    'community members not engaging', 'online course community',
-  ],
-  subreddits = [
-    'entrepreneur', 'onlinebusiness', 'marketing', 'digitalmarketing',
-    'sidehustle', 'ecommerce', 'freelance', 'consulting',
-    'passive_income', 'contentcreation', 'youtubers', 'podcasting',
-    'socialmediamarketing', 'startups', 'smallbusiness',
-  ],
-  timeFilter        = 'year',
-  sortBy            = 'top',
-  maxPostsPerSearch = 100,
-  maxPagesPerSearch = 2,
-  includeComments   = true,
-  maxCommentsPerPost = 20,
-  minPostUpvotes    = 0,       // 0 = uzmi SVE, ne filtriraj
-  proxyConfig       = { useApifyProxy: true },
+  // Keyword control
+  extraKeywords        = [],          // dodaj svoje keyword-e na vrh
+  useGeneratedKeywords = true,        // koristi 1000+ auto-generated keywords
+  maxPagesPerSearch    = 2,           // pagination po queriju (2 × 100 = 200 posts/query)
+  // Subreddit control
+  targetedSubreddits   = SUBREDDITS, // override lista subreddita
+  onlyPriorityOnSubs   = true,        // true = samo priority keywords na subredditima (brže)
+                                      // false = svi keywords na svakom subredditu (ogromno)
+  // Post collection
+  maxPostsPerSearch    = 100,         // Reddit max = 100
+  minPostUpvotes       = 0,           // 0 = uzmi SVE
+  timeFilter           = 'year',      // week | month | year | all
+  sortBy               = 'top',       // top | relevance | new | comments
+  // Comments
+  includeComments      = true,
+  maxCommentsPerPost   = 25,
+  minCommentLength     = 20,
+  // Proxy
+  proxyConfig          = { useApifyProxy: true },
 } = input;
+
+// ─── Keywords ────────────────────────────────────────────────────────────────
+
+const generatedKeywords = useGeneratedKeywords ? generateKeywords() : [];
+const allKeywords = [...new Set([...extraKeywords, ...generatedKeywords])];
+const keywordsForSubs = onlyPriorityOnSubs ? PRIORITY_KEYWORDS : allKeywords;
+
+log.info(`=== Skool Reddit Research v4.0 ===`);
+log.info(`Generated keywords: ${generatedKeywords.length}`);
+log.info(`Total unique keywords: ${allKeywords.length}`);
+log.info(`Subreddits: ${targetedSubreddits.length}`);
+log.info(`Keywords on subreddits: ${keywordsForSubs.length}`);
+log.info(`Global searches: ${allKeywords.length * maxPagesPerSearch}`);
+log.info(`Targeted searches: ${keywordsForSubs.length * targetedSubreddits.length * maxPagesPerSearch}`);
+log.info(`Max total initial requests: ${(allKeywords.length + keywordsForSubs.length * targetedSubreddits.length) * maxPagesPerSearch}`);
+
+// ─── Crawler ──────────────────────────────────────────────────────────────────
 
 const proxyConfiguration = await Actor.createProxyConfiguration(proxyConfig);
 const seenPostIds = new Set();
 
-log.info(`Keywords: ${keywords.length} | Subreddits: ${subreddits.length}`);
-log.info(`Approx requests: ${(keywords.length * subreddits.length + keywords.length) * maxPagesPerSearch}`);
-
-// ─── Crawler ──────────────────────────────────────────────────────────────────
-
 const crawler = new HttpCrawler({
   proxyConfiguration,
-  maxConcurrency: 3,
+  maxConcurrency:            5,
   requestHandlerTimeoutSecs: 30,
-  maxRequestRetries: 3,
-  additionalMimeTypes: ['application/json'],
+  maxRequestRetries:         3,
+  additionalMimeTypes:       ['application/json'],
 
-  // Reddit voli custom User-Agent
   preNavigationHooks: [async ({ request }) => {
     request.headers = {
       ...request.headers,
-      'User-Agent': 'Mozilla/5.0 (compatible; SkoolResearch/3.0; +research)',
-      'Accept': 'application/json',
+      'User-Agent': 'Mozilla/5.0 (compatible; SkoolResearch/4.0; +research)',
+      'Accept':     'application/json',
     };
   }],
 
   async requestHandler({ request, body }) {
     const { type, keyword, subreddit, page: pageNum = 0 } = request.userData;
 
-    // ── SEARCH RESULTS ────────────────────────────────────────────────────────
+    // ── SEARCH ────────────────────────────────────────────────────────────────
     if (type === 'search') {
       let data;
-      try { data = JSON.parse(body); } catch { log.warning(`Bad JSON: ${request.url}`); return; }
+      try { data = JSON.parse(body); }
+      catch { log.warning(`Bad JSON: ${request.url}`); return; }
 
       const posts = data?.data?.children ?? [];
       const after = data?.data?.after;
 
-      log.info(`[${subreddit}] "${keyword}" page=${pageNum} → ${posts.length} posts`);
+      if (posts.length > 0) {
+        log.info(`[${subreddit ?? 'all'}] "${keyword?.slice(0, 50)}" p${pageNum} → ${posts.length} posts`);
+      }
 
-      // Paginacija
+      // Queue next page
       if (after && pageNum < maxPagesPerSearch - 1) {
-        const baseUrl = request.url.split('&after=')[0];
+        const base = request.url.split('&after=')[0];
         await Actor.addRequests([{
-          url: `${baseUrl}&after=${after}`,
+          url: `${base}&after=${after}`,
           userData: { type: 'search', keyword, subreddit, page: pageNum + 1 },
         }]);
       }
 
-      const commentRequests = [];
+      const commentQueue = [];
 
       for (const { data: post } of posts) {
         if (!post?.id || seenPostIds.has(post.id)) continue;
-        if (post.score < minPostUpvotes) continue;
+        if ((post.score ?? 0) < minPostUpvotes) continue;
         seenPostIds.add(post.id);
 
-        const hasBody = post.selftext && post.selftext !== '[deleted]' && post.selftext !== '[removed]';
+        const hasBody = post.selftext &&
+                        post.selftext !== '[deleted]' &&
+                        post.selftext !== '[removed]' &&
+                        post.selftext.length > 10;
 
-        // Ako post ima body — odmah sačuvaj
         if (hasBody) {
-          await Actor.pushData(buildPostRecord(post, keyword, subreddit));
+          await Actor.pushData(buildPost(post, keyword, subreddit));
         }
 
-        // Queue za komentare (vredni VOC data)
         if (includeComments && post.num_comments > 0) {
-          commentRequests.push({
+          commentQueue.push({
             url: `https://www.reddit.com/comments/${post.id}.json?sort=top&limit=${maxCommentsPerPost}&depth=1`,
             userData: {
               type:      'comments',
@@ -123,7 +130,7 @@ const crawler = new HttpCrawler({
               subreddit: post.subreddit,
               keyword,
               permalink: post.permalink,
-              createdAt: new Date(post.created_utc * 1000).toISOString(),
+              createdAt: new Date((post.created_utc ?? 0) * 1000).toISOString(),
               selftext:  hasBody ? post.selftext.slice(0, 3000) : '',
               flair:     post.link_flair_text ?? '',
             },
@@ -131,53 +138,58 @@ const crawler = new HttpCrawler({
         }
       }
 
-      if (commentRequests.length > 0) {
-        await Actor.addRequests(commentRequests);
+      if (commentQueue.length > 0) {
+        await Actor.addRequests(commentQueue);
       }
     }
 
     // ── COMMENTS ──────────────────────────────────────────────────────────────
     else if (type === 'comments') {
       let data;
-      try { data = JSON.parse(body); } catch { log.warning(`Bad JSON comments: ${request.url}`); return; }
+      try { data = JSON.parse(body); }
+      catch { log.warning(`Bad JSON comments: ${request.url}`); return; }
 
-      const { postId, title, score, numComm, author, keyword: kw, permalink, createdAt, selftext, flair } = request.userData;
-      const sub = request.userData.subreddit;
-
+      const ud = request.userData;
       const commentTree = data?.[1]?.data?.children ?? [];
+
       const comments = commentTree
         .filter(c => c.kind === 't1' && c.data?.body)
         .map(c => c.data)
-        .filter(c => c.body !== '[deleted]' && c.body !== '[removed]' && c.body.length > 20)
+        .filter(c =>
+          c.body !== '[deleted]' &&
+          c.body !== '[removed]' &&
+          c.body.length >= minCommentLength
+        )
         .slice(0, maxCommentsPerPost)
         .map(c => ({
           author:      c.author,
-          body:        c.body.slice(0, 1200),
-          score:       c.score,
+          body:        c.body.slice(0, 1500),
+          score:       c.score ?? 0,
           is_question: c.body.includes('?'),
         }));
 
-      if (comments.length === 0 && !selftext) return;
+      if (comments.length === 0 && !ud.selftext) return;
 
       await Actor.pushData({
-        source:         'Reddit',
-        subreddit:      `r/${sub}`,
-        keyword_used:   kw,
-        post_id:        postId,
-        title,
-        body:           selftext,
-        url:            `https://reddit.com${permalink}`,
-        upvotes:        score,
-        comment_count:  numComm,
-        author,
-        flair,
-        posted_at:      createdAt,
-        top_comments:   comments,
-        has_question_comments: comments.some(c => c.is_question),
-        scraped_at:     new Date().toISOString(),
+        source:                  'Reddit',
+        subreddit:               `r/${ud.subreddit}`,
+        keyword_used:            ud.keyword,
+        post_id:                 ud.postId,
+        title:                   ud.title,
+        body:                    ud.selftext ?? '',
+        url:                     `https://reddit.com${ud.permalink}`,
+        upvotes:                 ud.score,
+        comment_count:           ud.numComm,
+        author:                  ud.author,
+        flair:                   ud.flair,
+        posted_at:               ud.createdAt,
+        top_comments:            comments,
+        has_questions:           comments.some(c => c.is_question),
+        top_comment_count:       comments.length,
+        scraped_at:              new Date().toISOString(),
       });
 
-      log.info(`  ✓ r/${sub} | ${comments.length} comments | "${title?.slice(0, 60)}"`);
+      log.info(`  ✓ ${comments.length} comments | r/${ud.subreddit} | "${ud.title?.slice(0, 55)}"`);
     }
   },
 
@@ -186,21 +198,21 @@ const crawler = new HttpCrawler({
   },
 });
 
-// ─── Build Requests ───────────────────────────────────────────────────────────
+// ─── Build Request Queue ──────────────────────────────────────────────────────
 
 const requests = [];
 
-// 1. Global Reddit search po keyword-u (svi subredditi odjednom)
-for (const keyword of keywords) {
+// 1. GLOBAL search — all 1000+ keywords across all of Reddit
+for (const keyword of allKeywords) {
   requests.push({
     url: `https://www.reddit.com/search.json?q=${encodeURIComponent(keyword)}&sort=${sortBy}&t=${timeFilter}&limit=${maxPostsPerSearch}`,
     userData: { type: 'search', keyword, subreddit: 'all', page: 0 },
   });
 }
 
-// 2. Subreddit-specific search (restrict_sr=1)
-for (const keyword of keywords) {
-  for (const subreddit of subreddits) {
+// 2. TARGETED search — priority keywords × specific subreddits
+for (const keyword of keywordsForSubs) {
+  for (const subreddit of targetedSubreddits) {
     requests.push({
       url: `https://www.reddit.com/r/${subreddit}/search.json?q=${encodeURIComponent(keyword)}&restrict_sr=1&sort=${sortBy}&t=${timeFilter}&limit=${maxPostsPerSearch}`,
       userData: { type: 'search', keyword, subreddit, page: 0 },
@@ -208,15 +220,16 @@ for (const keyword of keywords) {
   }
 }
 
-log.info(`Starting ${requests.length} initial requests...`);
+log.info(`\nQueuing ${requests.length} initial requests...`);
 await crawler.run(requests);
 
-log.info('\nDone. Check Apify Dataset for results.');
+log.info(`\n✅ Done. Posts in Apify Dataset.`);
+log.info(`   Seen post IDs (deduped): ${seenPostIds.size}`);
 await Actor.exit();
 
 // ─── Helper ───────────────────────────────────────────────────────────────────
 
-function buildPostRecord(post, keyword, subreddit) {
+function buildPost(post, keyword, subreddit) {
   return {
     source:        'Reddit',
     subreddit:     `r/${post.subreddit}`,
@@ -225,11 +238,11 @@ function buildPostRecord(post, keyword, subreddit) {
     title:         post.title,
     body:          post.selftext?.slice(0, 3000) ?? '',
     url:           `https://reddit.com${post.permalink}`,
-    upvotes:       post.score,
-    comment_count: post.num_comments,
+    upvotes:       post.score ?? 0,
+    comment_count: post.num_comments ?? 0,
     author:        post.author,
     flair:         post.link_flair_text ?? '',
-    posted_at:     new Date(post.created_utc * 1000).toISOString(),
+    posted_at:     new Date((post.created_utc ?? 0) * 1000).toISOString(),
     scraped_at:    new Date().toISOString(),
   };
 }
