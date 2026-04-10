@@ -1,78 +1,78 @@
 /**
- * Skool Reddit Research Actor  v4.0
- * ====================================
- * Reddit JSON API — zero browsers, masivno skalabilno.
+ * Skool Reddit Research Actor  v5.0 — Precision Mode
+ * ====================================================
+ * Fokus: samo kreatori koji imaju PROBLEM sa Skool platformom.
+ * Odbacuje: promo, affiliate, "school" typo, irelevantne postove.
  *
- * Strategija:
- *  1. GLOBAL search — svi 1000+ keywords pretražuju ceo Reddit
- *  2. TARGETED search — 50 priority keywords × 80+ subreddits (restrict_sr=1)
- *  3. Komentari se uzimaju direktno iz JSON-a
- *  4. Nema filtera pri kolekciji — sve se čuva
- *  5. Pagination — do N stranica po queriju
+ * Dvoslojna zaštita od šuma:
+ *  1. Precizni creator-focused keywords (ne broad "skool")
+ *  2. Post-level relevance filter — svaki post se scoruje pre čuvanja
+ *
+ * API: Reddit JSON API (HttpCrawler, bez browsera)
  */
 
 import { Actor, log } from 'apify';
 import { HttpCrawler } from 'crawlee';
-import { generateKeywords, SUBREDDITS, PRIORITY_KEYWORDS } from './keywords.js';
+import { CREATOR_KEYWORDS, CREATOR_SUBREDDITS, PRIORITY_KEYWORDS } from './keywords.js';
+import { scoreRelevance, shouldFetchPost } from './relevance.js';
 
 await Actor.init();
 
 const input = await Actor.getInput() ?? {};
 
 const {
-  // Keyword control
-  extraKeywords        = [],          // dodaj svoje keyword-e na vrh
-  useGeneratedKeywords = true,        // koristi 1000+ auto-generated keywords
-  maxPagesPerSearch    = 2,           // pagination po queriju (2 × 100 = 200 posts/query)
-  // Subreddit control
-  targetedSubreddits   = SUBREDDITS, // override lista subreddita
-  onlyPriorityOnSubs   = true,        // true = samo priority keywords na subredditima (brže)
-                                      // false = svi keywords na svakom subredditu (ogromno)
-  // Post collection
-  maxPostsPerSearch    = 100,         // Reddit max = 100
-  minPostUpvotes       = 0,           // 0 = uzmi SVE
-  timeFilter           = 'year',      // week | month | year | all
-  sortBy               = 'top',       // top | relevance | new | comments
+  // Keywords
+  extraKeywords         = [],
+  useBuiltinKeywords    = true,
+  // Subreddits
+  subreddits            = CREATOR_SUBREDDITS,
+  // Collection settings
+  maxPostsPerSearch     = 100,
+  maxPagesPerSearch     = 3,
+  // Relevance filter
+  minRelevanceScore     = 30,     // 0 = čuvaj sve, 30 = creator/problem signal required
   // Comments
-  includeComments      = true,
-  maxCommentsPerPost   = 25,
-  minCommentLength     = 20,
+  includeComments       = true,
+  maxCommentsPerPost    = 30,
+  minCommentLength      = 25,
+  // Sort
+  timeFilter            = 'year',
+  sortBy                = 'top',
   // Proxy
-  proxyConfig          = { useApifyProxy: true },
+  proxyConfig           = { useApifyProxy: true },
 } = input;
 
-// ─── Keywords ────────────────────────────────────────────────────────────────
+const allKeywords = [
+  ...extraKeywords,
+  ...(useBuiltinKeywords ? CREATOR_KEYWORDS : []),
+];
 
-const generatedKeywords = useGeneratedKeywords ? generateKeywords() : [];
-const allKeywords = [...new Set([...extraKeywords, ...generatedKeywords])];
-const keywordsForSubs = onlyPriorityOnSubs ? PRIORITY_KEYWORDS : allKeywords;
+const uniqueKeywords = [...new Set(allKeywords)];
 
-log.info(`=== Skool Reddit Research v4.0 ===`);
-log.info(`Generated keywords: ${generatedKeywords.length}`);
-log.info(`Total unique keywords: ${allKeywords.length}`);
-log.info(`Subreddits: ${targetedSubreddits.length}`);
-log.info(`Keywords on subreddits: ${keywordsForSubs.length}`);
-log.info(`Global searches: ${allKeywords.length * maxPagesPerSearch}`);
-log.info(`Targeted searches: ${keywordsForSubs.length * targetedSubreddits.length * maxPagesPerSearch}`);
-log.info(`Max total initial requests: ${(allKeywords.length + keywordsForSubs.length * targetedSubreddits.length) * maxPagesPerSearch}`);
+log.info(`=== Skool Reddit Research v5.0 — Precision Mode ===`);
+log.info(`Keywords: ${uniqueKeywords.length} | Subreddits: ${subreddits.length}`);
+log.info(`Min relevance score: ${minRelevanceScore}`);
+log.info(`Strategy: ${PRIORITY_KEYWORDS.length} priority keywords × ${subreddits.length} subreddits + all keywords globally`);
 
-// ─── Crawler ──────────────────────────────────────────────────────────────────
+// ─── Crawler ─────────────────────────────────────────────────────────────────
 
 const proxyConfiguration = await Actor.createProxyConfiguration(proxyConfig);
 const seenPostIds = new Set();
+let totalSaved = 0;
+let totalRejected = 0;
 
 const crawler = new HttpCrawler({
   proxyConfiguration,
-  maxConcurrency:            5,
+  maxConcurrency: 4,
   requestHandlerTimeoutSecs: 30,
-  maxRequestRetries:         3,
-  additionalMimeTypes:       ['application/json'],
+  maxRequestRetries: 3,
+  additionalMimeTypes: ['application/json'],
 
   preNavigationHooks: [async ({ request }) => {
     request.headers = {
       ...request.headers,
-      'User-Agent': 'Mozilla/5.0 (compatible; SkoolResearch/4.0; +research)',
-      'Accept':     'application/json',
+      'User-Agent': 'Mozilla/5.0 (compatible; SkoolResearch/5.0)',
+      'Accept': 'application/json',
     };
   }],
 
@@ -88,12 +88,8 @@ const crawler = new HttpCrawler({
       const posts = data?.data?.children ?? [];
       const after = data?.data?.after;
 
-      if (posts.length > 0) {
-        log.info(`[${subreddit ?? 'all'}] "${keyword?.slice(0, 50)}" p${pageNum} → ${posts.length} posts`);
-      }
-
-      // Queue next page
-      if (after && pageNum < maxPagesPerSearch - 1) {
+      // Pagination
+      if (after && pageNum < maxPagesPerSearch - 1 && posts.length > 0) {
         const base = request.url.split('&after=')[0];
         await Actor.addRequests([{
           url: `${base}&after=${after}`,
@@ -102,40 +98,66 @@ const crawler = new HttpCrawler({
       }
 
       const commentQueue = [];
+      let pageRelevant = 0;
 
       for (const { data: post } of posts) {
         if (!post?.id || seenPostIds.has(post.id)) continue;
-        if ((post.score ?? 0) < minPostUpvotes) continue;
         seenPostIds.add(post.id);
 
         const hasBody = post.selftext &&
-                        post.selftext !== '[deleted]' &&
-                        post.selftext !== '[removed]' &&
-                        post.selftext.length > 10;
+          post.selftext !== '[deleted]' &&
+          post.selftext !== '[removed]' &&
+          post.selftext.length > 20;
 
-        if (hasBody) {
-          await Actor.pushData(buildPost(post, keyword, subreddit));
+        // Quick relevance pre-check from title + preview
+        const previewText = `${post.title} ${hasBody ? post.selftext.slice(0, 300) : ''}`;
+        if (!shouldFetchPost(post.title, hasBody ? post.selftext.slice(0, 300) : '')) {
+          totalRejected++;
+          continue;
         }
 
+        // Full relevance check on available text
+        const fullText = `${post.title} ${hasBody ? post.selftext : ''}`;
+        const relevance = scoreRelevance(fullText);
+
+        if (relevance.score < minRelevanceScore) {
+          totalRejected++;
+          log.debug(`  SKIP [${relevance.reason}] "${post.title?.slice(0, 60)}"`);
+          continue;
+        }
+
+        pageRelevant++;
+
+        if (hasBody) {
+          await Actor.pushData(buildPost(post, keyword, subreddit, relevance));
+          totalSaved++;
+        }
+
+        // Queue for comments (will do full relevance check on comments too)
         if (includeComments && post.num_comments > 0) {
           commentQueue.push({
-            url: `https://www.reddit.com/comments/${post.id}.json?sort=top&limit=${maxCommentsPerPost}&depth=1`,
+            url: `https://www.reddit.com/comments/${post.id}.json?sort=top&limit=${maxCommentsPerPost}&depth=2`,
             userData: {
-              type:      'comments',
-              postId:    post.id,
-              title:     post.title,
-              score:     post.score,
-              numComm:   post.num_comments,
-              author:    post.author,
-              subreddit: post.subreddit,
+              type:         'comments',
+              postId:       post.id,
+              title:        post.title,
+              score:        post.score,
+              numComm:      post.num_comments,
+              author:       post.author,
+              subreddit:    post.subreddit,
               keyword,
-              permalink: post.permalink,
-              createdAt: new Date((post.created_utc ?? 0) * 1000).toISOString(),
-              selftext:  hasBody ? post.selftext.slice(0, 3000) : '',
-              flair:     post.link_flair_text ?? '',
+              permalink:    post.permalink,
+              createdAt:    new Date((post.created_utc ?? 0) * 1000).toISOString(),
+              selftext:     hasBody ? post.selftext.slice(0, 3000) : '',
+              flair:        post.link_flair_text ?? '',
+              postRelevance: relevance.score,
             },
           });
         }
+      }
+
+      if (posts.length > 0) {
+        log.info(`[${subreddit ?? 'all'}] "${keyword?.slice(0, 45)}" p${pageNum} → ${posts.length} posts, ${pageRelevant} relevant`);
       }
 
       if (commentQueue.length > 0) {
@@ -152,7 +174,7 @@ const crawler = new HttpCrawler({
       const ud = request.userData;
       const commentTree = data?.[1]?.data?.children ?? [];
 
-      const comments = commentTree
+      const rawComments = commentTree
         .filter(c => c.kind === 't1' && c.data?.body)
         .map(c => c.data)
         .filter(c =>
@@ -160,36 +182,49 @@ const crawler = new HttpCrawler({
           c.body !== '[removed]' &&
           c.body.length >= minCommentLength
         )
-        .slice(0, maxCommentsPerPost)
-        .map(c => ({
-          author:      c.author,
-          body:        c.body.slice(0, 1500),
-          score:       c.score ?? 0,
-          is_question: c.body.includes('?'),
-        }));
+        .slice(0, maxCommentsPerPost);
 
-      if (comments.length === 0 && !ud.selftext) return;
-
-      await Actor.pushData({
-        source:                  'Reddit',
-        subreddit:               `r/${ud.subreddit}`,
-        keyword_used:            ud.keyword,
-        post_id:                 ud.postId,
-        title:                   ud.title,
-        body:                    ud.selftext ?? '',
-        url:                     `https://reddit.com${ud.permalink}`,
-        upvotes:                 ud.score,
-        comment_count:           ud.numComm,
-        author:                  ud.author,
-        flair:                   ud.flair,
-        posted_at:               ud.createdAt,
-        top_comments:            comments,
-        has_questions:           comments.some(c => c.is_question),
-        top_comment_count:       comments.length,
-        scraped_at:              new Date().toISOString(),
+      // Filter comments for relevance too
+      // Exception: if the post itself was highly relevant, keep all comments (they provide context)
+      const isHighlyRelevantPost = (ud.postRelevance ?? 0) >= 60;
+      const relevantComments = rawComments.filter(c => {
+        if (isHighlyRelevantPost) return true; // Keep all comments on high-relevance posts
+        const cr = scoreRelevance(`${ud.title} ${c.body}`); // Include post title for context
+        return cr.score >= 15; // Lower threshold for comments (they're shorter)
       });
 
-      log.info(`  ✓ ${comments.length} comments | r/${ud.subreddit} | "${ud.title?.slice(0, 55)}"`);
+      if (relevantComments.length === 0 && !ud.selftext) return;
+
+      const mappedComments = relevantComments.map(c => ({
+        author:          c.author,
+        body:            c.body.slice(0, 1500),
+        score:           c.score ?? 0,
+        is_question:     c.body.includes('?'),
+        relevance_score: scoreRelevance(`${ud.title} ${c.body}`).score,
+      }));
+
+      await Actor.pushData({
+        source:             'Reddit',
+        subreddit:          `r/${ud.subreddit}`,
+        keyword_used:       ud.keyword,
+        post_id:            ud.postId,
+        title:              ud.title,
+        body:               ud.selftext ?? '',
+        url:                `https://reddit.com${ud.permalink}`,
+        upvotes:            ud.score,
+        comment_count:      ud.numComm,
+        author:             ud.author,
+        flair:              ud.flair,
+        posted_at:          ud.createdAt,
+        post_relevance:     ud.postRelevance,
+        top_comments:       mappedComments,
+        relevant_comment_count: mappedComments.length,
+        has_questions:      mappedComments.some(c => c.is_question),
+        scraped_at:         new Date().toISOString(),
+      });
+
+      totalSaved++;
+      log.info(`  ✓ r/${ud.subreddit} | ${mappedComments.length} relevant comments | "${ud.title?.slice(0, 55)}"`);
     }
   },
 
@@ -198,21 +233,21 @@ const crawler = new HttpCrawler({
   },
 });
 
-// ─── Build Request Queue ──────────────────────────────────────────────────────
+// ─── Build Requests ───────────────────────────────────────────────────────────
 
 const requests = [];
 
-// 1. GLOBAL search — all 1000+ keywords across all of Reddit
-for (const keyword of allKeywords) {
+// 1. Global search — svi keywords pretražuju ceo Reddit
+for (const keyword of uniqueKeywords) {
   requests.push({
     url: `https://www.reddit.com/search.json?q=${encodeURIComponent(keyword)}&sort=${sortBy}&t=${timeFilter}&limit=${maxPostsPerSearch}`,
     userData: { type: 'search', keyword, subreddit: 'all', page: 0 },
   });
 }
 
-// 2. TARGETED search — priority keywords × specific subreddits
-for (const keyword of keywordsForSubs) {
-  for (const subreddit of targetedSubreddits) {
+// 2. Targeted subreddit search — PRIORITY keywords × relevantni subredditi
+for (const keyword of PRIORITY_KEYWORDS) {
+  for (const subreddit of subreddits) {
     requests.push({
       url: `https://www.reddit.com/r/${subreddit}/search.json?q=${encodeURIComponent(keyword)}&restrict_sr=1&sort=${sortBy}&t=${timeFilter}&limit=${maxPostsPerSearch}`,
       userData: { type: 'search', keyword, subreddit, page: 0 },
@@ -220,29 +255,33 @@ for (const keyword of keywordsForSubs) {
   }
 }
 
-log.info(`\nQueuing ${requests.length} initial requests...`);
+log.info(`\nQueuing ${requests.length} requests...`);
+log.info(`Expected: ${uniqueKeywords.length} global + ${PRIORITY_KEYWORDS.length * subreddits.length} targeted`);
 await crawler.run(requests);
 
-log.info(`\n✅ Done. Posts in Apify Dataset.`);
-log.info(`   Seen post IDs (deduped): ${seenPostIds.size}`);
+log.info(`\n✅ Done.`);
+log.info(`   Saved: ${totalSaved} | Rejected as irrelevant: ${totalRejected}`);
+log.info(`   Signal ratio: ${totalSaved}/${totalSaved + totalRejected} (${Math.round(totalSaved / (totalSaved + totalRejected || 1) * 100)}%)`);
 await Actor.exit();
 
 // ─── Helper ───────────────────────────────────────────────────────────────────
 
-function buildPost(post, keyword, subreddit) {
+function buildPost(post, keyword, _subreddit, relevance) {
   return {
-    source:        'Reddit',
-    subreddit:     `r/${post.subreddit}`,
-    keyword_used:  keyword,
-    post_id:       post.id,
-    title:         post.title,
-    body:          post.selftext?.slice(0, 3000) ?? '',
-    url:           `https://reddit.com${post.permalink}`,
-    upvotes:       post.score ?? 0,
-    comment_count: post.num_comments ?? 0,
-    author:        post.author,
-    flair:         post.link_flair_text ?? '',
-    posted_at:     new Date((post.created_utc ?? 0) * 1000).toISOString(),
-    scraped_at:    new Date().toISOString(),
+    source:           'Reddit',
+    subreddit:        `r/${post.subreddit}`,
+    keyword_used:     keyword,
+    post_id:          post.id,
+    title:            post.title,
+    body:             post.selftext?.slice(0, 3000) ?? '',
+    url:              `https://reddit.com${post.permalink}`,
+    upvotes:          post.score ?? 0,
+    comment_count:    post.num_comments ?? 0,
+    author:           post.author,
+    flair:            post.link_flair_text ?? '',
+    posted_at:        new Date((post.created_utc ?? 0) * 1000).toISOString(),
+    relevance_score:  relevance.score,
+    relevance_signals: relevance.signals,
+    scraped_at:       new Date().toISOString(),
   };
 }
