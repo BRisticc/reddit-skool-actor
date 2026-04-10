@@ -1,219 +1,183 @@
 /**
- * Skool Reddit Research Actor  v2.0
+ * Skool Reddit Research Actor  v3.0
  * ====================================
- * Scrapes Reddit za Skool community pain points.
- * Sve keywords editabilne iz Apify Input taba.
- * NEMA AI — čist keyword matching.
- *
- * Kako radi:
- *  1. Uzima keyword listu iz Input-a
- *  2. Pretražuje svaki keyword na svakom subredditu (old.reddit.com)
- *  3. Scoruje svaki post korisnikovim pain rečima
- *  4. Otvara visoko-scorirane postove, uzima pun tekst + komentare
- *  5. Izvlači VOC quote-ove (rečenice koje sadrže pain language)
- *  6. Čuva sve u Apify Dataset-u
+ * Koristi Reddit JSON API — NEMA Puppeteer, nema brsuzera.
+ * 100 postova po requestu, pagination, 25 keywords × 15 subreddits.
+ * Nema pain score filtera pri kolekciji — sve se čuva, analiza posle.
  */
 
 import { Actor, log } from 'apify';
-import { PuppeteerCrawler, sleep } from 'crawlee';
-import { scorePain, categorize, extractVocQuotes } from './scorer.js';
+import { HttpCrawler } from 'crawlee';
 
 await Actor.init();
-
-// ─── Učitaj Input ─────────────────────────────────────────────────────────────
 
 const input = await Actor.getInput() ?? {};
 
 const {
-  searchKeywords    = ['skool community members not engaging'],
-  extraKeywords     = [],
-  subreddits        = ['skool', 'entrepreneur', 'onlinecourse', 'marketing'],
-  painSignalWords   = ["can't", 'broken', 'manually', 'churn', 'ghost town'],
-  maxPostsPerSearch = 15,
-  minPainScore      = 20,
+  keywords = [
+    // Branded - direktno
+    'skool.com', 'skool community platform', 'skool review',
+    'skool worth it', 'skool pricing', 'skool problems',
+    // Comparisons - competitor intent
+    'skool vs kajabi', 'skool vs circle', 'skool vs mighty networks',
+    'skool vs teachable', 'skool vs discord', 'skool vs facebook groups',
+    'skool alternative', 'kajabi vs skool', 'circle vs skool',
+    // Pain points - operational
+    'skool members not engaging', 'skool ghost town', 'skool churn',
+    'skool email list', 'skool zapier', 'skool automation',
+    'skool analytics', 'skool limitations', 'skool not working',
+    // Influencer / brand
+    'skool sam ovens', 'skool alex hormozi', 'skool games leaderboard',
+    'skool affiliate program', 'skool community growth',
+    // Generic community pain (catches non-branded discussions)
+    'online community platform problems', 'membership site churn',
+    'community members not engaging', 'online course community',
+  ],
+  subreddits = [
+    'entrepreneur', 'onlinebusiness', 'marketing', 'digitalmarketing',
+    'sidehustle', 'ecommerce', 'freelance', 'consulting',
+    'passive_income', 'contentcreation', 'youtubers', 'podcasting',
+    'socialmediamarketing', 'startups', 'smallbusiness',
+  ],
   timeFilter        = 'year',
-  sortBy            = 'relevance',
+  sortBy            = 'top',
+  maxPostsPerSearch = 100,
+  maxPagesPerSearch = 2,
   includeComments   = true,
-  proxyConfig       = { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] },
+  maxCommentsPerPost = 20,
+  minPostUpvotes    = 0,       // 0 = uzmi SVE, ne filtriraj
+  proxyConfig       = { useApifyProxy: true },
 } = input;
 
-// Spoji default + extra keywords, ukloni duplikate
-const allKeywords = [...new Set([...searchKeywords, ...extraKeywords])];
-
-log.info('=== Skool Reddit Research Actor v2.0 ===');
-log.info(`Keywords: ${allKeywords.length} | Subreddits: ${subreddits.length}`);
-log.info(`Pain words: ${painSignalWords.length} | Min score: ${minPainScore}`);
-log.info(`Total searches: ${allKeywords.length * subreddits.length}`);
-
-// ─── Crawler Setup ────────────────────────────────────────────────────────────
-
 const proxyConfiguration = await Actor.createProxyConfiguration(proxyConfig);
-const seenPostIds = new Set(); // Deduplication
+const seenPostIds = new Set();
 
-const crawler = new PuppeteerCrawler({
+log.info(`Keywords: ${keywords.length} | Subreddits: ${subreddits.length}`);
+log.info(`Approx requests: ${(keywords.length * subreddits.length + keywords.length) * maxPagesPerSearch}`);
+
+// ─── Crawler ──────────────────────────────────────────────────────────────────
+
+const crawler = new HttpCrawler({
   proxyConfiguration,
-  maxConcurrency:            2,
-  requestHandlerTimeoutSecs: 90,
-  maxRequestRetries:         3,
+  maxConcurrency: 3,
+  requestHandlerTimeoutSecs: 30,
+  maxRequestRetries: 3,
+  additionalMimeTypes: ['application/json'],
 
-  launchContext: {
-    launchOptions: {
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--window-size=1280,900',
-        '--lang=en-US,en',
-      ],
-    },
-  },
+  // Reddit voli custom User-Agent
+  preNavigationHooks: [async ({ request }) => {
+    request.headers = {
+      ...request.headers,
+      'User-Agent': 'Mozilla/5.0 (compatible; SkoolResearch/3.0; +research)',
+      'Accept': 'application/json',
+    };
+  }],
 
-  async requestHandler({ page, request }) {
-    const { type, keyword, subreddit } = request.userData;
+  async requestHandler({ request, body }) {
+    const { type, keyword, subreddit, page: pageNum = 0 } = request.userData;
 
-    // Blokiraj slike/fontove/medije — brže i jeftinije (manje Apify CU)
-    await page.setRequestInterception(true);
-    page.on('request', req => {
-      if (['image', 'font', 'media', 'stylesheet'].includes(req.resourceType())) {
-        req.abort();
-      } else {
-        req.continue();
-      }
-    });
-
-    // ── SEARCH STRANICA ───────────────────────────────────────────────────────
+    // ── SEARCH RESULTS ────────────────────────────────────────────────────────
     if (type === 'search') {
-      log.info(`Searching r/${subreddit}: "${keyword}"`);
+      let data;
+      try { data = JSON.parse(body); } catch { log.warning(`Bad JSON: ${request.url}`); return; }
 
-      try {
-        await page.waitForSelector('.search-result-link, .thing.link', { timeout: 20000 });
-      } catch {
-        log.warning(`Nema rezultata: r/${subreddit} | "${keyword}"`);
-        return;
+      const posts = data?.data?.children ?? [];
+      const after = data?.data?.after;
+
+      log.info(`[${subreddit}] "${keyword}" page=${pageNum} → ${posts.length} posts`);
+
+      // Paginacija
+      if (after && pageNum < maxPagesPerSearch - 1) {
+        const baseUrl = request.url.split('&after=')[0];
+        await Actor.addRequests([{
+          url: `${baseUrl}&after=${after}`,
+          userData: { type: 'search', keyword, subreddit, page: pageNum + 1 },
+        }]);
       }
-      await sleep(500);
 
-      const posts = await page.evaluate((maxP) => {
-        const items = document.querySelectorAll('.search-result-link, .thing.link');
-        const results = [];
-        items.forEach((el, i) => {
-          if (i >= maxP) return;
-          const titleEl = el.querySelector('a.search-title, a.title');
-          const scoreEl = el.querySelector('.search-score-word, .score');
-          const commEl  = el.querySelector('.search-comments, .comments');
-          const timeEl  = el.querySelector('time');
-          const href    = titleEl?.getAttribute('href') ?? '';
-          const match   = href.match(/comments\/([a-z0-9]+)\//i);
-          if (!match || !titleEl) return;
-          results.push({
-            id:           match[1],
-            title:        titleEl.textContent.trim(),
-            score:        parseInt(scoreEl?.textContent?.replace(/\D/g, '') ?? '0') || 0,
-            commentCount: parseInt(commEl?.textContent?.replace(/\D/g, '') ?? '0') || 0,
-            href,
-            timestamp:    timeEl?.getAttribute('datetime') ?? '',
-          });
-        });
-        return results;
-      }, maxPostsPerSearch);
+      const commentRequests = [];
 
-      log.info(`  → ${posts.length} postova pronađeno`);
-
-      for (const post of posts) {
-        if (seenPostIds.has(post.id)) continue;
+      for (const { data: post } of posts) {
+        if (!post?.id || seenPostIds.has(post.id)) continue;
+        if (post.score < minPostUpvotes) continue;
         seenPostIds.add(post.id);
 
-        // Brzi score po naslovu — ako izgleda relevantno, otvori pun post
-        const quickScore = scorePain(post.title, painSignalWords);
-        if (quickScore.painScore >= minPainScore - 15) {
-          const url = post.href.startsWith('http')
-            ? post.href.replace('www.reddit.com', 'old.reddit.com')
-            : `https://old.reddit.com${post.href}`;
+        const hasBody = post.selftext && post.selftext !== '[deleted]' && post.selftext !== '[removed]';
 
-          await Actor.addRequests([{
-            url,
-            userData: {
-              type:         'post',
-              postId:       post.id,
-              title:        post.title,
-              upvotes:      post.score,
-              commentCount: post.commentCount,
-              subreddit,
-              keyword,
-              timestamp:    post.timestamp,
-            },
-          }]);
+        // Ako post ima body — odmah sačuvaj
+        if (hasBody) {
+          await Actor.pushData(buildPostRecord(post, keyword, subreddit));
         }
+
+        // Queue za komentare (vredni VOC data)
+        if (includeComments && post.num_comments > 0) {
+          commentRequests.push({
+            url: `https://www.reddit.com/comments/${post.id}.json?sort=top&limit=${maxCommentsPerPost}&depth=1`,
+            userData: {
+              type:      'comments',
+              postId:    post.id,
+              title:     post.title,
+              score:     post.score,
+              numComm:   post.num_comments,
+              author:    post.author,
+              subreddit: post.subreddit,
+              keyword,
+              permalink: post.permalink,
+              createdAt: new Date(post.created_utc * 1000).toISOString(),
+              selftext:  hasBody ? post.selftext.slice(0, 3000) : '',
+              flair:     post.link_flair_text ?? '',
+            },
+          });
+        }
+      }
+
+      if (commentRequests.length > 0) {
+        await Actor.addRequests(commentRequests);
       }
     }
 
-    // ── INDIVIDUALNI POST ─────────────────────────────────────────────────────
-    else if (type === 'post') {
-      const { postId, title, upvotes, commentCount, subreddit: sub, keyword: kw, timestamp } = request.userData;
+    // ── COMMENTS ──────────────────────────────────────────────────────────────
+    else if (type === 'comments') {
+      let data;
+      try { data = JSON.parse(body); } catch { log.warning(`Bad JSON comments: ${request.url}`); return; }
 
-      try {
-        await page.waitForSelector('.usertext-body, #siteTable', { timeout: 15000 });
-      } catch {
-        log.warning(`  Post body nije učitan: ${postId}`);
-        return;
-      }
-      await sleep(400);
+      const { postId, title, score, numComm, author, keyword: kw, permalink, createdAt, selftext, flair } = request.userData;
+      const sub = request.userData.subreddit;
 
-      const data = await page.evaluate((inclComments) => {
-        // Pun tekst posta
-        const bodyEl = document.querySelector('.usertext-body .md');
-        const body   = bodyEl?.innerText?.trim() ?? '';
+      const commentTree = data?.[1]?.data?.children ?? [];
+      const comments = commentTree
+        .filter(c => c.kind === 't1' && c.data?.body)
+        .map(c => c.data)
+        .filter(c => c.body !== '[deleted]' && c.body !== '[removed]' && c.body.length > 20)
+        .slice(0, maxCommentsPerPost)
+        .map(c => ({
+          author:      c.author,
+          body:        c.body.slice(0, 1200),
+          score:       c.score,
+          is_question: c.body.includes('?'),
+        }));
 
-        // Top komentari
-        const comments = [];
-        if (inclComments) {
-          document.querySelectorAll('.comment .usertext-body .md').forEach((el, i) => {
-            if (i >= 8) return;
-            const text = el.innerText?.trim() ?? '';
-            if (text.length > 25 && text !== '[deleted]' && text !== '[removed]') {
-              comments.push(text.slice(0, 600));
-            }
-          });
-        }
-
-        return { body, comments };
-      }, includeComments);
-
-      // Scoruj pun tekst (naslov + body)
-      const fullText = `${title} ${data.body}`;
-      const scoring  = scorePain(fullText, painSignalWords);
-
-      if (scoring.painScore < minPainScore) return; // Preskoči ako nije dovoljno pain
-
-      const category     = categorize(fullText);
-      const vocQuotes    = extractVocQuotes(data.body || title, painSignalWords);
-      const commentQuotes = data.comments.flatMap(c => extractVocQuotes(c, painSignalWords, 2));
+      if (comments.length === 0 && !selftext) return;
 
       await Actor.pushData({
-        source:            'Reddit',
-        subreddit:         `r/${sub}`,
-        keyword_used:      kw,
-        post_id:           postId,
+        source:         'Reddit',
+        subreddit:      `r/${sub}`,
+        keyword_used:   kw,
+        post_id:        postId,
         title,
-        body:              data.body.slice(0, 1500),
-        url:               `https://reddit.com/comments/${postId}/`,
-        upvotes,
-        comment_count:     commentCount,
-        posted_at:         timestamp,
-        problem_category:  category,
-        voc_quotes:        vocQuotes,
-        comment_voc:       commentQuotes,
-        top_comments:      data.comments.slice(0, 5),
-        pain_score:        scoring.painScore,
-        signal:            scoring.signal,
-        matched_words:     scoring.matchedWords,
-        matched_patterns:  scoring.matchedPatterns,
-        scraped_at:        new Date().toISOString(),
+        body:           selftext,
+        url:            `https://reddit.com${permalink}`,
+        upvotes:        score,
+        comment_count:  numComm,
+        author,
+        flair,
+        posted_at:      createdAt,
+        top_comments:   comments,
+        has_question_comments: comments.some(c => c.is_question),
+        scraped_at:     new Date().toISOString(),
       });
 
-      log.info(`  ✓ [${scoring.signal}] ${scoring.painScore}/100 | "${title.slice(0, 60)}"`);
+      log.info(`  ✓ r/${sub} | ${comments.length} comments | "${title?.slice(0, 60)}"`);
     }
   },
 
@@ -222,20 +186,50 @@ const crawler = new PuppeteerCrawler({
   },
 });
 
-// ─── Pokreni ──────────────────────────────────────────────────────────────────
+// ─── Build Requests ───────────────────────────────────────────────────────────
 
-// old.reddit.com ima čist HTML, bez React hydration — pouzdanije i brže
-const requests = allKeywords.flatMap(keyword =>
-  subreddits.map(subreddit => ({
-    url: `https://old.reddit.com/r/${subreddit}/search?q=${encodeURIComponent(keyword)}&sort=${sortBy}&t=${timeFilter}&restrict_sr=on`,
-    userData: { type: 'search', keyword, subreddit },
-  }))
-);
+const requests = [];
 
-log.info(`\nQueuing ${requests.length} pretrage...`);
+// 1. Global Reddit search po keyword-u (svi subredditi odjednom)
+for (const keyword of keywords) {
+  requests.push({
+    url: `https://www.reddit.com/search.json?q=${encodeURIComponent(keyword)}&sort=${sortBy}&t=${timeFilter}&limit=${maxPostsPerSearch}`,
+    userData: { type: 'search', keyword, subreddit: 'all', page: 0 },
+  });
+}
+
+// 2. Subreddit-specific search (restrict_sr=1)
+for (const keyword of keywords) {
+  for (const subreddit of subreddits) {
+    requests.push({
+      url: `https://www.reddit.com/r/${subreddit}/search.json?q=${encodeURIComponent(keyword)}&restrict_sr=1&sort=${sortBy}&t=${timeFilter}&limit=${maxPostsPerSearch}`,
+      userData: { type: 'search', keyword, subreddit, page: 0 },
+    });
+  }
+}
+
+log.info(`Starting ${requests.length} initial requests...`);
 await crawler.run(requests);
 
-log.info('\n✅ Reddit scraping završen. Rezultati su u Apify Dataset-u.');
-log.info('💡 Promeni keywords: Input tab → searchKeywords ili extraKeywords');
-
+log.info('\nDone. Check Apify Dataset for results.');
 await Actor.exit();
+
+// ─── Helper ───────────────────────────────────────────────────────────────────
+
+function buildPostRecord(post, keyword, subreddit) {
+  return {
+    source:        'Reddit',
+    subreddit:     `r/${post.subreddit}`,
+    keyword_used:  keyword,
+    post_id:       post.id,
+    title:         post.title,
+    body:          post.selftext?.slice(0, 3000) ?? '',
+    url:           `https://reddit.com${post.permalink}`,
+    upvotes:       post.score,
+    comment_count: post.num_comments,
+    author:        post.author,
+    flair:         post.link_flair_text ?? '',
+    posted_at:     new Date(post.created_utc * 1000).toISOString(),
+    scraped_at:    new Date().toISOString(),
+  };
+}

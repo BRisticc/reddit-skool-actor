@@ -9,16 +9,15 @@
   },
   "dependencies": {
     "apify": "^3.7.0",
-    "crawlee": "^3.16.0",
-    "puppeteer": "*"
+    "crawlee": "^3.16.0"
   },
   "engines": {
     "node": ">=20.0.0"
   },
   "apify": {
-    "title": "Skool — Reddit VOC Research",
-    "description": "Mines Reddit for authentic Skool community pain language. All keywords, subreddits, and filters editable from Input tab. No AI required.",
-    "version": "2.0.0",
+    "title": "Skool — Reddit Research v3",
+    "description": "Uses Reddit JSON API (no browser) to collect all Skool-related posts and comments across 15+ subreddits. 25 built-in keywords, pagination, no filtering — collects everything.",
+    "version": "3.0.0",
     "inputSchema": {
       "title": "Skool Reddit Research",
       "type": "object",
